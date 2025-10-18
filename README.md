@@ -17,3 +17,23 @@ Automatically skips missing references and saves results to an “output” fold
 Provides real-time progress via tqdm and final success/failure statistics.
 
 In short: it’s a multithreaded image-processing tool that automates generating specular maps for texture sets, with adjustable intensity and safety against numeric errors.
+
+
+PYTHON MODULE REQUIREMENTS:
+
+pip install pillow numpy tqdm
+
+pip install tkinter
+
+
+Put the script and your textures in a directory like this:
+
+/MyTextures
+ ├─ FF12SpecGen.py
+ ├─ wood.png
+ ├─ wood_spec.png      ← reference spec map
+ ├─ metal.png
+ ├─ metal_spec.png
+ └─ ...
+
+Each diffuse texture (e.g. wood.png) should have a matching spec reference (e.g. wood_spec.png).

@@ -1,6 +1,6 @@
 Summary of FF12SpecGen.py:
 
-A Python utility script that batch-generates specular texture maps for 3D assets using diffuse textures and existing reference spec maps.
+A Python utility script that batch-generates specular texture maps for Final Fantasy 12 TZA using diffuse textures and existing reference spec maps.
 
 Key features:
 

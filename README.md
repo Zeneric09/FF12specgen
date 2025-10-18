@@ -29,11 +29,17 @@ pip install tkinter
 Put the script and your textures in a directory like this:
 
 /MyTextures
+
  ├─ FF12SpecGen.py
+ 
  ├─ wood.png
+ 
  ├─ wood_spec.png      ← reference spec map
+ 
  ├─ metal.png
+ 
  ├─ metal_spec.png
+ 
  └─ ...
 
 Each diffuse texture (e.g. wood.png) should have a matching spec reference (e.g. wood_spec.png).

@@ -12,8 +12,6 @@ Generates new spec maps by blending diffuse and reference spec data with safe ma
 
 Processes textures in parallel using multithreading for speed.
 
-Automatically skips missing references and saves results to an “output” folder.
-
 Provides real-time progress via tqdm and final success/failure statistics.
 
 In short: it’s a multithreaded image-processing tool that automates generating specular maps for texture sets, with adjustable intensity and safety against numeric errors.
@@ -21,9 +19,7 @@ In short: it’s a multithreaded image-processing tool that automates generating
 
 PYTHON MODULE REQUIREMENTS:
 
-pip install pillow numpy tqdm
-
-pip install tkinter
+pip install pillow numpy opencv-python tqdm
 
 
 Put the script and your textures in a directory like this:

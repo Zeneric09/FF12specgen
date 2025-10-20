@@ -1,65 +1,29 @@
 import os
-import concurrent.futures
 from PIL import Image, ImageOps, ImageEnhance
 import numpy as np
 import multiprocessing
 from functools import partial
 from tqdm import tqdm
+import cv2
 
 # ==============================
 # ⚙️ CONFIGURATION
 # ==============================
-DEFAULT_SPEC_INTENSITY = 0.225
+DEFAULT_SPEC_INTENSITY = 0.5
 MAX_WORKERS = max(1, min(multiprocessing.cpu_count(), 16))
 # ==============================
 
 
-def safe_ask_spec_intensity(default_value=DEFAULT_SPEC_INTENSITY):
-    """Prompt user for spec intensity (GUI if available, otherwise console)."""
+def get_user_settings(default_intensity=DEFAULT_SPEC_INTENSITY):
     try:
-        import tkinter as tk
-
-        class IntensityDialog(tk.Tk):
-            def __init__(self):
-                super().__init__()
-                self.title("FF12 SpecGen - Spec Intensity")
-                self.resizable(False, False)
-                self.value = default_value
-
-                tk.Label(self, text="Enter spec intensity (higher = shinier):").pack(padx=10, pady=10)
-
-                self.entry = tk.Entry(self)
-                self.entry.insert(0, str(default_value))
-                self.entry.pack(padx=10, pady=5)
-                self.entry.focus_set()
-
-                ok_btn = tk.Button(self, text="OK", width=10, command=self.on_ok)
-                ok_btn.pack(pady=10)
-
-            def on_ok(self):
-                try:
-                    val = float(self.entry.get())
-                    self.value = max(0.1, min(val, 5.0))
-                except Exception:
-                    self.value = default_value
-                self.destroy()
-
-        dialog = IntensityDialog()
-        dialog.mainloop()
-
-        # Ensure Tkinter fully cleaned up before multithreading starts
-        import tkinter
-        tkinter._default_root = None
-
-        return dialog.value
-
+        val = input(f"Enter spec intensity (default {default_intensity}): ").strip()
+        val = float(val) if val else default_intensity
+        fallback_input = input("Generate diffuse-based specs when no reference found? (y/n, default y): ").strip().lower()
+        fallback = not fallback_input.startswith("n")
+        return max(0.1, min(val, 5.0)), fallback
     except Exception:
-        try:
-            val = float(input(f"⚙️ Enter spec intensity multiplier (default {default_value}): ").strip())
-            return max(0.1, min(val, 5.0))
-        except Exception:
-            print(f"⚠️ Invalid input. Using default {default_value}")
-            return default_value
+        print(f"⚠️ Invalid or no input. Using defaults (intensity={default_intensity}, fallback=True)")
+        return default_intensity, True
 
 
 def preprocess_diffuse(diffuse_img):
@@ -69,50 +33,101 @@ def preprocess_diffuse(diffuse_img):
     return enhanced_gray.convert("RGB")
 
 
+def adaptive_metal_mask(diffuse_np):
+    mean = np.mean(diffuse_np, axis=-1)
+    sat = np.std(diffuse_np, axis=-1) / (mean + 1e-5)
+    return (sat < 0.15) & (mean < 0.5)
+
+
 def generate_spec_from_reference(diffuse_img, reference_spec_img, spec_intensity=DEFAULT_SPEC_INTENSITY):
-    """Generates a specular map based on a reference and diffuse texture, with safe math for high intensity values."""
     diffuse_pre = preprocess_diffuse(diffuse_img)
     diffuse_np = np.array(diffuse_pre, dtype=np.float32) / 255.0
-
     ref_np = np.array(reference_spec_img.convert("RGB").resize(diffuse_pre.size, Image.LANCZOS),
                       dtype=np.float32) / 255.0
 
-    # Compute luminance safely
     diff_lum = np.mean(diffuse_np, axis=-1)
     ref_lum = np.mean(ref_np, axis=-1)
+    ratio = np.clip(np.mean(ref_lum / np.clip(diff_lum, 1e-3, None)), 0.5, 2.0)
 
-    diff_lum_safe = np.clip(diff_lum, 1e-4, None)
-    ratio = ref_lum / diff_lum_safe
-    ratio_mean = np.clip(np.mean(ratio), 0.5, 2.0)
+    spec_base = np.clip(diffuse_np * ratio, 0, 1)
+    blend_ratio = np.clip(np.mean(np.abs(ref_np - diffuse_np)), 0.3, 0.7)
+    spec_np = np.clip(blend_ratio * ref_np + (1 - blend_ratio) * spec_base, 0, 1)
 
-    spec_base = np.clip(diffuse_np * ratio_mean, 0, 1)
-    spec_np = np.clip(0.6 * spec_base + 0.4 * ref_np, 0, 1)
+    inv = np.clip(1.0 - np.mean(diffuse_np, axis=-1), 0, 1)
+    spec_np *= np.power(inv, 0.75)[..., None]
 
-    # Apply intensity tweak safely (handles NaN, Inf, overflow)
-    spec_np = spec_np * spec_intensity
-    spec_np = np.nan_to_num(spec_np, nan=0.0, posinf=1.0, neginf=0.0)
-    spec_np = np.clip(spec_np, 0, 1)
+    gray = np.mean(diffuse_np, axis=-1)
+    gx, gy = cv2.Sobel(gray, cv2.CV_32F, 1, 0, 3), cv2.Sobel(gray, cv2.CV_32F, 0, 1, 3)
+    spec_np += np.sqrt(gx ** 2 + gy ** 2)[..., None] * 0.15
 
-    if not np.isfinite(spec_np).all():
-        print(f"⚠️ Warning: invalid pixel values detected (intensity={spec_intensity})")
+    r, g, b = ref_np[..., 0], ref_np[..., 1], ref_np[..., 2]
+    skin_mask = (b > 0.7) & (b > r * 2) & (b > g * 2)
+    matte_mask = (b > 0.3) & (b < 0.7) & (r < 0.4) & (g < 0.4)
+    yellow_shiny_mask = (r > 0.6) & (g > 0.5) & (b < 0.35) & ((r + g) > 1.2)
+    metal_mask = (r > 0.5) & (g > 0.45) & (b > 0.5) & (np.abs(r - b) < 0.2)
 
-    # Optional brightness-based metal mask enhancement
-    brightness = np.mean(diffuse_np, axis=-1)
-    metal_mask = (brightness < 0.4) & (diffuse_np[..., 2] < 0.3)
-    spec_np[metal_mask] = np.clip(spec_np[metal_mask] * 1.25, 0, 1)
+    spec_np[skin_mask] *= [0.4, 0.38, 0.35]
+    spec_np[matte_mask] *= 0.15
+    spec_np[yellow_shiny_mask] *= [1.8, 1.75, 1.5]
+    spec_np[metal_mask] *= [1.3, 1.25, 1.2]
 
+    if np.any(skin_mask):
+        skin_blur = cv2.GaussianBlur(spec_np, (11, 11), 0)
+        spec_np[skin_mask] = np.clip(skin_blur[skin_mask] * 0.8, 0, 1)
+
+    if np.any(yellow_shiny_mask):
+        shiny_gray = np.mean(spec_np, axis=-1)
+        blur = cv2.GaussianBlur(shiny_gray, (5, 5), 0)
+        highpass = np.clip(shiny_gray - blur, 0, 1)[..., None]
+        spec_np[yellow_shiny_mask] = np.clip(
+            spec_np[yellow_shiny_mask] + highpass[yellow_shiny_mask] * 1.2, 0, 1
+        )
+
+    if np.any(metal_mask):
+        spec_np[metal_mask] = np.clip(spec_np[metal_mask] * 1.2, 0, 1)
+
+    spec_np[adaptive_metal_mask(diffuse_np)] *= [1.1, 1.05, 0.9]
+    spec_np = np.clip(spec_np * spec_intensity, 0, 1)
     return Image.fromarray((spec_np * 255).astype(np.uint8))
+
+
+def generate_spec_from_diffuse(diffuse_img, spec_intensity=DEFAULT_SPEC_INTENSITY):
+    diffuse_pre = preprocess_diffuse(diffuse_img)
+    diffuse_np = np.array(diffuse_pre, dtype=np.float32) / 255.0
+    gray = np.mean(diffuse_np, axis=-1)
+
+    blur_small = cv2.GaussianBlur(gray, (3, 3), 0)
+    blur_large = cv2.GaussianBlur(gray, (13, 13), 0)
+    detail = np.clip((blur_small - blur_large) * 4.0 + 0.5, 0, 1)
+    inv = np.clip(1.0 - detail, 0, 1)
+    spec_np = np.power(inv, 0.75)
+
+    avg = np.mean(diffuse_np, axis=-1)
+    spec_np = np.clip(np.power(1.2 - avg, 0.8) * spec_np, 0, 1)
+
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, 3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, 3)
+    edges = np.sqrt(gx ** 2 + gy ** 2)
+    spec_np = np.clip(spec_np + edges * 0.15, 0, 1)
+
+    metal_mask = adaptive_metal_mask(diffuse_np)
+    spec_np[metal_mask] *= 1.3
+
+    tint = diffuse_np ** 0.8
+    tint /= (np.mean(tint, axis=-1, keepdims=True) + 1e-5)
+    spec_rgb = np.clip(spec_np[..., None] * tint, 0, 1)
+    spec_rgb = np.clip(spec_rgb * spec_intensity, 0, 1)
+    return Image.fromarray((spec_rgb * 255).astype(np.uint8))
 
 
 def find_matching_spec(diffuse_path):
     folder = os.path.dirname(diffuse_path)
     base_name = os.path.splitext(os.path.basename(diffuse_path))[0]
-    possible_spec_name = f"{base_name}_spec.png"
-    candidate = os.path.join(folder, possible_spec_name)
+    candidate = os.path.join(folder, f"{base_name}_spec.png")
     return candidate if os.path.exists(candidate) else None
 
 
-def process_texture(in_path, base_folder, output_folder, spec_intensity):
+def process_texture(in_path, base_folder, output_folder, spec_intensity, use_fallback_generation):
     rel_path = os.path.relpath(in_path, base_folder)
     out_path = os.path.join(output_folder, os.path.splitext(rel_path)[0] + "_spec.png")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -120,17 +135,19 @@ def process_texture(in_path, base_folder, output_folder, spec_intensity):
     try:
         diffuse_img = Image.open(in_path)
         matching_spec_path = find_matching_spec(in_path)
-
-        if not matching_spec_path:
-            print(f"⚠️ Skipped (no ref spec): {rel_path}")
+        if matching_spec_path:
+            local_ref = Image.open(matching_spec_path)
+            spec_img = generate_spec_from_reference(diffuse_img, local_ref, spec_intensity)
+            print(f"💾 Using reference spec for: {rel_path}")
+        elif use_fallback_generation:
+            print(f"⚠️ No ref spec found. Generating from diffuse: {rel_path}")
+            spec_img = generate_spec_from_diffuse(diffuse_img, spec_intensity)
+        else:
+            print(f"⏭️ Skipped (no ref spec): {rel_path}")
             return False
 
-        local_ref = Image.open(matching_spec_path)
-        spec_img = generate_spec_from_reference(diffuse_img, local_ref, spec_intensity)
         spec_img.save(out_path)
-        print(f"💾 Saved spec: {rel_path}")
         return True
-
     except Exception as e:
         print(f"❌ Failed {rel_path}: {e}")
         return False
@@ -141,25 +158,26 @@ def collect_diffuse_textures(base_folder):
     for root, _, files in os.walk(base_folder):
         if "output" in root.lower():
             continue
-        for fname in files:
-            if fname.lower().endswith(".png") and "_spec" not in fname.lower():
-                diffuse_paths.append(os.path.join(root, fname))
+        for f in files:
+            if f.lower().endswith(".png") and "_spec" not in f.lower():
+                diffuse_paths.append(os.path.join(root, f))
     return diffuse_paths
 
 
-def batch_generate_spec(base_folder, output_folder, spec_intensity):
+def batch_generate_spec(base_folder, output_folder, spec_intensity, use_fallback_generation):
+    import concurrent.futures
     os.makedirs(output_folder, exist_ok=True)
     all_textures = collect_diffuse_textures(base_folder)
     total = len(all_textures)
     print(f"\n🧮 Processing {total} textures using {MAX_WORKERS} threads...")
     print(f"🎚️ Spec intensity: {spec_intensity}")
+    print(f"🎨 Fallback diffuse-based generation: {'ON' if use_fallback_generation else 'OFF'}")
 
-    func = partial(
-        process_texture,
-        base_folder=base_folder,
-        output_folder=output_folder,
-        spec_intensity=spec_intensity,
-    )
+    func = partial(process_texture,
+                   base_folder=base_folder,
+                   output_folder=output_folder,
+                   spec_intensity=spec_intensity,
+                   use_fallback_generation=use_fallback_generation)
 
     processed = 0
     failed = 0
@@ -175,20 +193,12 @@ def batch_generate_spec(base_folder, output_folder, spec_intensity):
     print(f"✅ Successfully processed: {processed}")
     print(f"⚠️ Skipped or failed: {failed}")
     print(f"🖼️ Output folder: {os.path.abspath(output_folder)}\n")
-
     input("Press any key to exit...")
 
 
 if __name__ == "__main__":
-    spec_intensity = safe_ask_spec_intensity()
-
-    # Prevent Tcl threading errors before spawning threads
-    try:
-        import tkinter
-        tkinter._default_root = None
-    except Exception:
-        pass
-
+    # 🔧 Headless mode — no Tkinter GUI
+    spec_intensity, use_fallback_generation = get_user_settings()
     current_dir = os.path.dirname(os.path.abspath(__file__))
     output_folder = os.path.join(current_dir, "output")
-    batch_generate_spec(current_dir, output_folder, spec_intensity)
+    batch_generate_spec(current_dir, output_folder, spec_intensity, use_fallback_generation)
